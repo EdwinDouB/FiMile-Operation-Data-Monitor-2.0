@@ -17,14 +17,18 @@ def _read_with_aliases(*names: str, default: str = "") -> str:
     return default
 
 
-def _load_mysql_config() -> dict[str, str | int]:
+def _load_mysql_config() -> dict[str, str | int | dict[str, str]]:
     config = {
         "host": _read_with_aliases("MYSQL_HOST", "DB_HOST"),
         "port": int(_read_with_aliases("MYSQL_PORT", "DB_PORT", default="3306")),
-        "username": _read_with_aliases("MYSQL_USERNAME", "MYSQL_USER", "DB_USERNAME", "DB_USER"),
+        "user": _read_with_aliases("MYSQL_USERNAME", "MYSQL_USER", "DB_USERNAME", "DB_USER"),
         "password": _read_with_aliases("MYSQL_PASSWORD", "MYSQL_PASS", "DB_PASSWORD"),
         "database": _read_with_aliases("MYSQL_DATABASE", "MYSQL_DB", "DB_DATABASE", "DB_NAME"),
     }
+
+    ssl_ca = _read_with_aliases("MYSQL_SSL_CA")
+    if ssl_ca:
+        config["ssl"] = {"ca": ssl_ca}
 
     if not config["host"]:
         _apply_mysql_url_fallback(config)
@@ -32,7 +36,7 @@ def _load_mysql_config() -> dict[str, str | int]:
     return config
 
 
-def _apply_mysql_url_fallback(config: dict[str, str | int]) -> None:
+def _apply_mysql_url_fallback(config: dict[str, str | int | dict[str, str]]) -> None:
     """Load DB connection fields from URL-like envs when split fields are not provided."""
     raw_url = _read_with_aliases("MYSQL_URL", "DATABASE_URL", "DB_URL")
     if not raw_url:
@@ -47,7 +51,7 @@ def _apply_mysql_url_fallback(config: dict[str, str | int]) -> None:
     if parsed.port:
         config["port"] = int(parsed.port)
     if parsed.username:
-        config["username"] = parsed.username
+        config["user"] = parsed.username
     if parsed.password:
         config["password"] = parsed.password
     if parsed.path and parsed.path != "/":
@@ -257,7 +261,7 @@ def _require_db_env() -> None:
     missing = []
     if not config["host"]:
         missing.append("MYSQL_HOST / DATABASE_URL")
-    if not config["username"]:
+    if not config["user"]:
         missing.append("MYSQL_USERNAME / DATABASE_URL")
     if not config["password"]:
         missing.append("MYSQL_PASSWORD / DATABASE_URL")
@@ -295,7 +299,7 @@ def fetch_tracking_numbers_by_date(start_date: date, end_date: date) -> list[str
     conn = pymysql.connect(
         host=str(config["host"]),
         port=int(config["port"]),
-        user=str(config["username"]),
+        user=str(config["user"]),
         password=str(config["password"]),
         database=str(config["database"]),
         charset="utf8mb4",
@@ -379,7 +383,7 @@ def fetch_receive_province_map(tracking_ids: tuple[str, ...]) -> dict[str, str]:
     conn = pymysql.connect(
         host=str(config["host"]),
         port=int(config["port"]),
-        user=str(config["username"]),
+        user=str(config["user"]),
         password=str(config["password"]),
         database=str(config["database"]),
         charset="utf8mb4",
@@ -459,7 +463,7 @@ def fetch_sender_info_map(tracking_ids: tuple[str, ...]) -> dict[str, dict[str, 
     conn = pymysql.connect(
         host=str(config["host"]),
         port=int(config["port"]),
-        user=str(config["username"]),
+        user=str(config["user"]),
         password=str(config["password"]),
         database=str(config["database"]),
         charset="utf8mb4",
@@ -568,7 +572,7 @@ def fetch_router_messages_map(tracking_ids: tuple[str, ...]) -> dict[str, Any]:
     conn = pymysql.connect(
         host=str(config["host"]),
         port=int(config["port"]),
-        user=str(config["username"]),
+        user=str(config["user"]),
         password=str(config["password"]),
         database=str(config["database"]),
         charset="utf8mb4",
