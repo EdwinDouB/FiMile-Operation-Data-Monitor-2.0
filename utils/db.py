@@ -36,6 +36,22 @@ def _load_mysql_config() -> dict[str, str | int | dict[str, str]]:
     return config
 
 
+def _build_mysql_connect_kwargs(database_override: str | None = None) -> dict[str, Any]:
+    config = _load_mysql_config()
+    connect_kwargs: dict[str, Any] = {
+        "host": str(config["host"]),
+        "port": int(config["port"]),
+        "user": str(config["user"]),
+        "password": str(config["password"]),
+        "database": str(database_override or config["database"]),
+        "charset": "utf8mb4",
+        "autocommit": True,
+    }
+    if "ssl" in config:
+        connect_kwargs["ssl"] = config["ssl"]
+    return connect_kwargs
+
+
 def _apply_mysql_url_fallback(config: dict[str, str | int | dict[str, str]]) -> None:
     """Load DB connection fields from URL-like envs when split fields are not provided."""
     raw_url = _read_with_aliases("MYSQL_URL", "DATABASE_URL", "DB_URL")
@@ -254,26 +270,113 @@ def _resolve_column(columns: set[str], env_names: tuple[str, ...], candidates: t
             return candidate
     return ""
 
+
+def _iter_tracking_query_sources() -> list[dict[str, Any]]:
+    config = _load_mysql_config()
+    current_database = str(config.get("database") or "").strip()
+    report_database = _read_with_aliases(
+        "TRACKING_SOURCE_REPORT_DATABASE",
+        "REPORT_MYSQL_DATABASE",
+        default="report",
+    ).strip()
+    report_table = _read_with_aliases(
+        "TRACKING_SOURCE_REPORT_TABLE",
+        "REPORT_TRACKING_TABLE",
+        default="package_level_records",
+    ).strip()
+
+    sources: list[dict[str, Any]] = [
+        {
+            "database": current_database,
+            "resolver": _resolve_waybill_table,
+            "tracking_env_names": ("WAYBILL_TRACKING_COLUMN",),
+            "tracking_candidates": ("tracking_number", "tracking_id", "waybill_no"),
+            "date_env_names": ("WAYBILL_CREATED_AT_COLUMN",),
+            "date_candidates": ("created_at", "create_time", "created_time", "gmt_create"),
+            "label": f"{current_database}.waybill",
+        }
+    ]
+
+    if report_database and report_table:
+        if report_database != current_database or report_table != "waybill_waybills":
+            sources.append(
+                {
+                    "database": report_database,
+                    "resolver": lambda _conn, table_name=report_table: table_name,
+                    "tracking_env_names": ("TRACKING_SOURCE_REPORT_TRACKING_COLUMN", "REPORT_TRACKING_COLUMN"),
+                    "tracking_candidates": ("tracking_number", "tracking_id", "waybill_no"),
+                    "date_env_names": ("TRACKING_SOURCE_REPORT_DATE_COLUMN", "REPORT_DATE_COLUMN"),
+                    "date_candidates": ("date", "create_time", "created_time", "created_at"),
+                    "label": f"{report_database}.{report_table}",
+                }
+            )
+
+    unique_sources: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for source in sources:
+        database = str(source.get("database") or "").strip()
+        label = str(source.get("label") or "").strip()
+        key = (database, label)
+        if not database or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_sources.append(source)
+    return unique_sources
+
+
+def _fetch_tracking_numbers_from_connection(
+    conn: Any,
+    resolver: Any,
+    tracking_env_names: tuple[str, ...],
+    tracking_candidates: tuple[str, ...],
+    date_env_names: tuple[str, ...],
+    date_candidates: tuple[str, ...],
+    start_dt: datetime,
+    end_exclusive_dt: datetime,
+) -> list[str]:
+    table_name = resolver(conn) if callable(resolver) else str(resolver or "").strip()
+    if not _is_safe_identifier(table_name):
+        return []
+
+    table_columns = _load_table_columns(conn, table_name)
+    if not table_columns:
+        return []
+
+    tracking_column = _resolve_column(table_columns, tracking_env_names, tracking_candidates)
+    created_at_column = _resolve_column(table_columns, date_env_names, date_candidates)
+    if not tracking_column or not created_at_column:
+        return []
+
+    with conn.cursor() as cur:
+        sql = f"""
+            SELECT DISTINCT {tracking_column} AS tracking_number
+            FROM {table_name}
+            WHERE {created_at_column} >= %s AND {created_at_column} < %s
+            AND {tracking_column} IS NOT NULL AND {tracking_column} <> ''
+            ORDER BY {tracking_column} ASC
+        """
+        cur.execute(sql, (start_dt, end_exclusive_dt))
+
+        tracking_numbers: list[str] = []
+        while True:
+            rows = cur.fetchmany(DB_FETCH_BATCH_SIZE)
+            if not rows:
+                break
+            tracking_numbers.extend(str(r["tracking_number"]).strip() for r in rows if r.get("tracking_number"))
+        return tracking_numbers
+
 DB_FETCH_BATCH_SIZE = max(100, int(read_config("DB_FETCH_BATCH_SIZE", "5000")))
 
 
-def _open_mysql_connection() -> Any:
+def _open_mysql_connection(database_override: str | None = None) -> Any:
     try:
         import pymysql  # type: ignore
     except Exception as e:
         raise RuntimeError("缺少依赖 pymysql。请先 pip install pymysql") from e
 
-    config = _load_mysql_config()
-    return pymysql.connect(
-        host=str(config["host"]),
-        port=int(config["port"]),
-        user=str(config["user"]),
-        password=str(config["password"]),
-        database=str(config["database"]),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+    connect_kwargs = _build_mysql_connect_kwargs(database_override=database_override)
+    connect_kwargs["cursorclass"] = pymysql.cursors.DictCursor
+    return pymysql.connect(**connect_kwargs)
 
 def _require_db_env() -> None:
     config = _load_mysql_config()
@@ -370,16 +473,15 @@ def fetch_tracking_numbers_by_date(start_date: date, end_date: date) -> list[str
     # return ["ZX34043383"]
 
     """
-    Query waybill_waybills for tracking_number where created_at is between
-    [start_date 00:00:00, end_date 23:59:59.999999] (inclusive by date).
+    Query tracking numbers for the selected date range.
+
+    Historically the app only queried the current schema's waybill table by
+    `created_at`. In production, some daily operational data is instead stored in
+    `report.package_level_records` and keyed by its `date` column, so searching
+    only the waybill schema can wrongly return zero rows even though the report
+    table already has data.
     """
     _require_db_env()
-
-    # lazy import so the app can still run without DB deps until this mode is used
-    try:
-        import pymysql  # type: ignore
-    except Exception as e:
-        raise RuntimeError("缺少依赖 pymysql。请先 pip install pymysql") from e
 
     if end_date < start_date:
         return []
@@ -388,59 +490,44 @@ def fetch_tracking_numbers_by_date(start_date: date, end_date: date) -> list[str
     # Use an exclusive upper-bound at next-day 00:00:00 to avoid dropping rows on end_date.
     end_exclusive_dt = datetime.combine(end_date + timedelta(days=1), time.min)
 
-    config = _load_mysql_config()
-    conn = pymysql.connect(
-        host=str(config["host"]),
-        port=int(config["port"]),
-        user=str(config["user"]),
-        password=str(config["password"]),
-        database=str(config["database"]),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+    tracking_numbers: list[str] = []
+    seen: set[str] = set()
+    last_error: Exception | None = None
 
-    try:
-        table_name = _resolve_waybill_table(conn)
-        if not _is_safe_identifier(table_name):
-            return []
+    for source in _iter_tracking_query_sources():
+        database_name = str(source.get("database") or "").strip()
+        if not database_name:
+            continue
 
-        table_columns = _load_table_columns(conn, table_name)
-        if not table_columns:
-            return []
+        conn = None
+        try:
+            conn = _open_mysql_connection(database_override=database_name)
+            rows = _fetch_tracking_numbers_from_connection(
+                conn=conn,
+                resolver=source.get("resolver"),
+                tracking_env_names=tuple(source.get("tracking_env_names") or ()),
+                tracking_candidates=tuple(source.get("tracking_candidates") or ()),
+                date_env_names=tuple(source.get("date_env_names") or ()),
+                date_candidates=tuple(source.get("date_candidates") or ()),
+                start_dt=start_dt,
+                end_exclusive_dt=end_exclusive_dt,
+            )
+            for tracking_number in rows:
+                if tracking_number and tracking_number not in seen:
+                    seen.add(tracking_number)
+                    tracking_numbers.append(tracking_number)
+        except Exception as exc:
+            last_error = exc
+            continue
+        finally:
+            if conn is not None:
+                conn.close()
 
-        tracking_column = _resolve_column(
-            table_columns,
-            ("WAYBILL_TRACKING_COLUMN",),
-            ("tracking_number", "tracking_id", "waybill_no"),
-        )
-        created_at_column = _resolve_column(
-            table_columns,
-            ("WAYBILL_CREATED_AT_COLUMN",),
-            ("created_at", "create_time", "created_time", "gmt_create"),
-        )
-        if not tracking_column or not created_at_column:
-            return []
-
-        with conn.cursor() as cur:
-            sql = f"""
-                SELECT DISTINCT {tracking_column} AS tracking_number
-                FROM {table_name}
-                WHERE {created_at_column} >= %s AND {created_at_column} < %s
-                AND {tracking_column} IS NOT NULL AND {tracking_column} <> ''
-                ORDER BY {tracking_column} ASC
-            """
-            cur.execute(sql, (start_dt, end_exclusive_dt))
-
-            tracking_numbers: list[str] = []
-            while True:
-                rows = cur.fetchmany(DB_FETCH_BATCH_SIZE)
-                if not rows:
-                    break
-                tracking_numbers.extend(str(r["tracking_number"]).strip() for r in rows if r.get("tracking_number"))
-            return tracking_numbers
-    finally:
-        conn.close()
+    if tracking_numbers:
+        return tracking_numbers
+    if last_error is not None:
+        raise last_error
+    return []
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_tracking_numbers_by_delivery_window(start_date: date, end_date: date) -> list[str]:
