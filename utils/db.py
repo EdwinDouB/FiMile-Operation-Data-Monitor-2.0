@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta
 import json
 from typing import Any
 from urllib.parse import urlparse
+from pathlib import Path
 
 
 from dotenv import load_dotenv
@@ -17,6 +18,28 @@ def _read_with_aliases(*names: str, default: str = "") -> str:
     return default
 
 
+def _resolve_ssl_ca_path(raw_path: str) -> str:
+    value = str(raw_path or "").strip()
+    if not value:
+        return ""
+
+    path = Path(value).expanduser()
+    if path.is_absolute() and path.exists():
+        return str(path)
+
+    search_roots = [
+        Path.cwd(),
+        Path(__file__).resolve().parents[1],
+        Path(__file__).resolve().parent,
+    ]
+    for root in search_roots:
+        candidate = (root / path).resolve()
+        if candidate.exists():
+            return str(candidate)
+
+    return str(path if path.is_absolute() else path.resolve())
+
+
 def _load_mysql_config() -> dict[str, str | int | dict[str, str]]:
     config = {
         "host": _read_with_aliases("MYSQL_HOST", "DB_HOST"),
@@ -26,7 +49,7 @@ def _load_mysql_config() -> dict[str, str | int | dict[str, str]]:
         "database": _read_with_aliases("MYSQL_DATABASE", "MYSQL_DB", "DB_DATABASE", "DB_NAME"),
     }
 
-    ssl_ca = _read_with_aliases("MYSQL_SSL_CA")
+    ssl_ca = _resolve_ssl_ca_path(_read_with_aliases("MYSQL_SSL_CA"))
     if ssl_ca:
         config["ssl"] = {"ca": ssl_ca}
 
@@ -277,13 +300,23 @@ def _iter_tracking_query_sources() -> list[dict[str, Any]]:
     report_database = _read_with_aliases(
         "TRACKING_SOURCE_REPORT_DATABASE",
         "REPORT_MYSQL_DATABASE",
-        default="report",
     ).strip()
     report_table = _read_with_aliases(
         "TRACKING_SOURCE_REPORT_TABLE",
         "REPORT_TRACKING_TABLE",
         default="package_level_records",
     ).strip()
+
+    def _build_source(database: str, resolver: Any, label: str) -> dict[str, Any]:
+        return {
+            "database": database,
+            "resolver": resolver,
+            "tracking_env_names": ("TRACKING_SOURCE_REPORT_TRACKING_COLUMN", "REPORT_TRACKING_COLUMN"),
+            "tracking_candidates": ("tracking_number", "tracking_id", "waybill_no"),
+            "date_env_names": ("TRACKING_SOURCE_REPORT_DATE_COLUMN", "REPORT_DATE_COLUMN"),
+            "date_candidates": ("date", "biz_date", "create_time", "created_time", "created_at"),
+            "label": label,
+        }
 
     sources: list[dict[str, Any]] = [
         {
@@ -297,26 +330,33 @@ def _iter_tracking_query_sources() -> list[dict[str, Any]]:
         }
     ]
 
-    if report_database and report_table:
-        if report_database != current_database or report_table != "waybill_waybills":
+    if report_table:
+        if current_database:
             sources.append(
-                {
-                    "database": report_database,
-                    "resolver": lambda _conn, table_name=report_table: table_name,
-                    "tracking_env_names": ("TRACKING_SOURCE_REPORT_TRACKING_COLUMN", "REPORT_TRACKING_COLUMN"),
-                    "tracking_candidates": ("tracking_number", "tracking_id", "waybill_no"),
-                    "date_env_names": ("TRACKING_SOURCE_REPORT_DATE_COLUMN", "REPORT_DATE_COLUMN"),
-                    "date_candidates": ("date", "create_time", "created_time", "created_at"),
-                    "label": f"{report_database}.{report_table}",
-                }
+                _build_source(
+                    current_database,
+                    lambda _conn, table_name=report_table: table_name,
+                    f"{current_database}.{report_table}",
+                )
+            )
+
+        if report_database:
+            sources.append(
+                _build_source(
+                    report_database,
+                    lambda _conn, table_name=report_table: table_name,
+                    f"{report_database}.{report_table}",
+                )
             )
 
     unique_sources: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, str]] = set()
+    seen_keys: set[tuple[str, str, str]] = set()
     for source in sources:
         database = str(source.get("database") or "").strip()
         label = str(source.get("label") or "").strip()
-        key = (database, label)
+        resolver = source.get("resolver")
+        resolver_name = getattr(resolver, "__name__", str(resolver))
+        key = (database, label, resolver_name)
         if not database or key in seen_keys:
             continue
         seen_keys.add(key)
@@ -559,17 +599,7 @@ def fetch_receive_province_map(tracking_ids: tuple[str, ...]) -> dict[str, str]:
     if not tracking_ids_clean:
         return {}
 
-    config = _load_mysql_config()
-    conn = pymysql.connect(
-        host=str(config["host"]),
-        port=int(config["port"]),
-        user=str(config["user"]),
-        password=str(config["password"]),
-        database=str(config["database"]),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+    conn = _open_mysql_connection()
 
     receive_province_map: dict[str, str] = {}
     try:
@@ -639,17 +669,7 @@ def fetch_sender_info_map(tracking_ids: tuple[str, ...]) -> dict[str, dict[str, 
     if not tracking_ids_clean:
         return {}
 
-    config = _load_mysql_config()
-    conn = pymysql.connect(
-        host=str(config["host"]),
-        port=int(config["port"]),
-        user=str(config["user"]),
-        password=str(config["password"]),
-        database=str(config["database"]),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+    conn = _open_mysql_connection()
 
     sender_info_map: dict[str, dict[str, str]] = {}
     try:
@@ -748,17 +768,7 @@ def fetch_router_messages_map(tracking_ids: tuple[str, ...]) -> dict[str, Any]:
     if not tracking_ids_clean:
         return {}
 
-    config = _load_mysql_config()
-    conn = pymysql.connect(
-        host=str(config["host"]),
-        port=int(config["port"]),
-        user=str(config["user"]),
-        password=str(config["password"]),
-        database=str(config["database"]),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
+    conn = _open_mysql_connection()
 
     payload_map: dict[str, Any] = {}
     try:
