@@ -256,6 +256,25 @@ def _resolve_column(columns: set[str], env_names: tuple[str, ...], candidates: t
 
 DB_FETCH_BATCH_SIZE = max(100, int(read_config("DB_FETCH_BATCH_SIZE", "5000")))
 
+
+def _open_mysql_connection() -> Any:
+    try:
+        import pymysql  # type: ignore
+    except Exception as e:
+        raise RuntimeError("缺少依赖 pymysql。请先 pip install pymysql") from e
+
+    config = _load_mysql_config()
+    return pymysql.connect(
+        host=str(config["host"]),
+        port=int(config["port"]),
+        user=str(config["user"]),
+        password=str(config["password"]),
+        database=str(config["database"]),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+    )
+
 def _require_db_env() -> None:
     config = _load_mysql_config()
     missing = []
@@ -269,6 +288,80 @@ def _require_db_env() -> None:
         missing.append("MYSQL_DATABASE / DATABASE_URL")
     if missing:
         raise RuntimeError(f"MySQL 环境变量未配置：{', '.join(missing)}")
+
+
+def list_database_tables() -> list[dict[str, Any]]:
+    """Return all tables in current schema with row-count estimates for debugging."""
+    _require_db_env()
+
+    conn = _open_mysql_connection()
+    table_rows: list[dict[str, Any]] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW TABLES")
+            table_names: list[str] = []
+            for row in cur.fetchall() or []:
+                if not isinstance(row, dict):
+                    continue
+                for value in row.values():
+                    table_name = str(value or "").strip()
+                    if table_name:
+                        table_names.append(table_name)
+
+            for table_name in sorted(set(table_names)):
+                if not _is_safe_identifier(table_name):
+                    continue
+                row_count: int | None = None
+                try:
+                    cur.execute(f"SELECT COUNT(*) AS total_count FROM {table_name}")
+                    count_row = cur.fetchone() or {}
+                    row_count = int(count_row.get("total_count") or 0)
+                except Exception:
+                    row_count = None
+
+                table_rows.append(
+                    {
+                        "table_name": table_name,
+                        "row_count": row_count,
+                    }
+                )
+    finally:
+        conn.close()
+
+    return table_rows
+
+
+def fetch_table_rows_for_debug(table_name: str, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+    """Fetch table rows for debugging. Set limit <= 0 to fetch all rows."""
+    _require_db_env()
+
+    safe_table_name = str(table_name or "").strip()
+    if not _is_safe_identifier(safe_table_name):
+        raise RuntimeError(f"非法表名：{table_name}")
+    safe_limit = int(limit)
+    safe_offset = max(0, int(offset))
+
+    conn = _open_mysql_connection()
+    try:
+        with conn.cursor() as cur:
+            if safe_limit <= 0:
+                sql = f"SELECT * FROM {safe_table_name}"
+                params: tuple[Any, ...] = ()
+            else:
+                sql = f"SELECT * FROM {safe_table_name} LIMIT %s OFFSET %s"
+                params = (safe_limit, safe_offset)
+
+            cur.execute(sql, params)
+
+            rows: list[dict[str, Any]] = []
+            while True:
+                batch = cur.fetchmany(DB_FETCH_BATCH_SIZE)
+                if not batch:
+                    break
+                rows.extend(batch)
+            return rows
+    finally:
+        conn.close()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
