@@ -1727,6 +1727,75 @@ def main() -> None:
         with st.expander(tr("db_preview", count=len(raw_ids)), expanded=False):
             st.write(raw_ids[:50])
 
+    st.subheader("数据库调试区")
+    st.caption("用于排查“查不到单量”问题：可查看当前数据库中的所有表，以及任意表的样本数据。")
+    with st.expander("打开数据库调试区", expanded=False):
+        if st.button("刷新表列表", key="debug_refresh_tables"):
+            clear_query_caches()
+
+        try:
+            debug_tables = db.list_database_tables()
+            if not debug_tables:
+                st.info("当前数据库没有可见表。")
+            else:
+                debug_tables_df = pd.DataFrame(debug_tables)
+                st.dataframe(debug_tables_df, use_container_width=True, hide_index=True)
+
+                table_options = debug_tables_df["table_name"].astype(str).tolist()
+                selected_table = st.selectbox("选择要查看数据的表", options=table_options, key="debug_selected_table")
+                selected_count_series = debug_tables_df.loc[
+                    debug_tables_df["table_name"] == selected_table,
+                    "row_count",
+                ]
+                selected_count = None
+                if not selected_count_series.empty:
+                    selected_count = selected_count_series.iloc[0]
+
+                c_limit, c_offset = st.columns(2)
+                with c_limit:
+                    debug_limit = st.number_input(
+                        "读取行数（0 = 全量，谨慎）",
+                        min_value=0,
+                        max_value=100000,
+                        value=200,
+                        step=100,
+                        key="debug_limit",
+                    )
+                with c_offset:
+                    debug_offset = st.number_input(
+                        "偏移量",
+                        min_value=0,
+                        max_value=10000000,
+                        value=0,
+                        step=100,
+                        key="debug_offset",
+                    )
+
+                if selected_count is not None:
+                    st.caption(f"表 `{selected_table}` 记录数：{selected_count}")
+
+                if st.button("读取表数据", key="debug_read_table"):
+                    with st.spinner(f"读取 {selected_table} 数据中..."):
+                        rows = db.fetch_table_rows_for_debug(
+                            selected_table,
+                            limit=int(debug_limit),
+                            offset=int(debug_offset),
+                        )
+                    if not rows:
+                        st.info("未读取到数据。")
+                    else:
+                        debug_rows_df = pd.DataFrame(rows)
+                        st.dataframe(debug_rows_df, use_container_width=True)
+                        st.download_button(
+                            label=f"下载 {selected_table} 调试数据 CSV",
+                            data=debug_rows_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"debug_{selected_table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="debug_download_table_csv",
+                        )
+        except Exception as debug_error:
+            st.error(f"数据库调试区读取失败：{debug_error}")
+
     st.markdown("#### 报表时间筛选（按日期，可选）")
     timestamp_cols = st.columns(2)
     with timestamp_cols[0]:
